@@ -1,0 +1,4 @@
+flask
+pdfrw
+werkzeug
+gunicorn
