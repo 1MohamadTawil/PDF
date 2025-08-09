@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF-Designer + Filler (mit visueller Feld-Vorschau)
+PDF-Designer + Filler (drag & drop + resize)
 - / -> Filler (liest/füllt AcroForm falls vorhanden)
-- /designer -> PDF als Bild + Live-Overlay-Rechtecke bei Klick
+- /designer -> PDF als Bild + Overlay-Rechtecke (per Klick hinzufügen, per Drag verschieben, per Handle resize)
 - /build -> erzeugt NEUE fillable PDF anhand der gesetzten Felder
 """
 import io
@@ -34,7 +34,7 @@ TPL_LAYOUT = """
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
     <title>PDF Formular</title>
     <style>
-      :root { --accent: #ff3b30; }
+      :root { --accent: #0066ff; --accentBg: rgba(0,102,255,.08); }
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
       .container { max-width: 1100px; margin: 0 auto; }
       .card { border: 1px solid #ddd; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
@@ -47,11 +47,15 @@ TPL_LAYOUT = """
       .canvas-wrap { position: relative; display: inline-block; }
       img.page { display:block; max-width: 100%; border: 1px solid #ddd; border-radius: 12px; }
       .overlay { position:absolute; top:0; left:0; pointer-events:none; }
-      .rect { position:absolute; border: 2px dashed var(--accent); background: rgba(255,59,48,.06); pointer-events:none; }
+      .rect { position:absolute; border: 2px dashed var(--accent); background: var(--accentBg); pointer-events:auto; }
+      .rect.selected { border-color:#ff3b30; }
       .pill { position:absolute; transform: translate(-50%, -100%); background: var(--accent); color:#fff; font-size:11px; padding:2px 6px; border-radius: 999px; white-space:nowrap; pointer-events:none;}
+      .handle { position:absolute; width:10px; height:10px; right:-6px; bottom:-6px; background:#fff; border:2px solid var(--accent); border-radius:2px; cursor:nwse-resize; }
       .toolbar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; flex-wrap:wrap; }
       .small { font-size: 12px; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .list { font-size:12px; }
+      .list code { background:#f7f7f7; padding:2px 4px; border-radius:6px; }
     </style>
   </head>
   <body>
@@ -110,7 +114,7 @@ TPL_DESIGNER = """
 {% extends \"layout.html\" %}
 {% block content %}
   <div class=\"card\">
-    <h2>Designer: Felder definieren</h2>
+    <h2>Designer: Felder definieren (Drag & Drop + Resize)</h2>
     <div class=\"toolbar\">
       <label>Feldname: <input type=\"text\" id=\"fname\" placeholder=\"z.B. kunde_name\"></label>
       <label>Breite: <input type=\"number\" id=\"fwidth\" value=\"180\" min=\"10\" class=\"small\"></label>
@@ -120,9 +124,9 @@ TPL_DESIGNER = """
         <button type=\"submit\">Neue fillable PDF erzeugen</button>
       </form>
       <a class=\"btn\" href=\"{{ url_for('index') }}\">Zurück</a>
-      <span class=\"muted small\">Tipp: Zoomen mit Browser (cmd/strg + / -)</span>
+      <span class=\"muted small\">Shift halten beim Ziehen = fein (1px Schritte)</span>
     </div>
-    <p class=\"muted\">Klicke auf die Seite, um ein Feld zu setzen. Jedes Feld erscheint sofort als rotes Rechteck.</p>
+    <p class=\"muted\">Klicke um neues Feld zu setzen. Ziehe Rechtecke zum Verschieben, nutze die Ecke zum Größen ändern. Klick auf Label = umbenennen.</p>
   </div>
 
   {% for i in range(1, page_count+1) %}
@@ -137,6 +141,7 @@ TPL_DESIGNER = """
 
   <div class=\"card\">
     <h3>Aktuelles Template ({{ template_name }})</h3>
+    <div class=\"list muted mono" id=\"list\"></div>
     <pre class=\"mono small\" id=\"templatePre\">{{ template_json }}</pre>
     <div class=\"row\">
       <button onclick=\"undo()\">Letztes Feld entfernen</button>
@@ -146,73 +151,144 @@ TPL_DESIGNER = """
 
   <script>
     const template = {{ template_json | safe }};
+    let selectedId = null;
+    let drag = null; // {id, mode:'move'|'resize', startX, startY, startFx, startFy, startW, startH, page}
 
-    function drawOverlay() {
-      // Leeren
+    function sx(img){ return img.width / img.naturalWidth; }
+    function sy(img){ return img.height / img.naturalHeight; }
+
+    function redraw() {
       document.querySelectorAll('.overlay').forEach(ov => ov.innerHTML = '');
       if (!template.fields) return;
-      for (const f of template.fields) {
-        const wrap = document.getElementById('wrap' + f.page);
+      for (let idx=0; idx<template.fields.length; idx++) {
+        const f = template.fields[idx];
         const img = document.getElementById('img' + f.page);
         const ov = document.getElementById('ov' + f.page);
-        if (!wrap || !img || !ov) continue;
-        // Skaliere von natural -> aktuell
-        const sx = img.width / img.naturalWidth;
-        const sy = img.height / img.naturalHeight;
-        const left = f.x * sx;
-        const top = f.y * sy;
-        const w = f.w * sx;
-        const h = f.h * sy;
+        if (!img || !ov) continue;
+        const _sx = sx(img), _sy = sy(img);
+        const left = f.x * _sx, top = f.y * _sy, w = f.w * _sx, h = f.h * _sy;
         const rect = document.createElement('div');
-        rect.className = 'rect';
-        rect.style.left = left + 'px';
-        rect.style.top = top + 'px';
-        rect.style.width = w + 'px';
-        rect.style.height = h + 'px';
-        const pill = document.createElement('div');
-        pill.className = 'pill';
-        pill.style.left = (left + w/2) + 'px';
-        pill.style.top = top + 'px';
-        pill.textContent = f.name;
-        ov.appendChild(rect);
-        ov.appendChild(pill);
-        // Größe der Overlay-Fläche an Bild anpassen
-        ov.style.width = img.clientWidth + 'px';
-        ov.style.height = img.clientHeight + 'px';
+        rect.className = 'rect' + (idx===selectedId ? ' selected' : '');
+        rect.style.left = left + 'px'; rect.style.top = top + 'px'; rect.style.width = w + 'px'; rect.style.height = h + 'px';
+        rect.dataset.id = idx; rect.dataset.page = f.page;
+        rect.addEventListener('mousedown', startMove);
+        const label = document.createElement('div');
+        label.className = 'pill'; label.style.left = (left + w/2) + 'px'; label.style.top = top + 'px'; label.textContent = f.name;
+        label.dataset.id = idx; label.addEventListener('click', renameField);
+        const handle = document.createElement('div');
+        handle.className = 'handle'; handle.dataset.id = idx; handle.dataset.page = f.page;
+        handle.addEventListener('mousedown', startResize);
+        ov.appendChild(rect); ov.appendChild(label); rect.appendChild(handle);
+        ov.style.width = img.clientWidth + 'px'; ov.style.height = img.clientHeight + 'px';
       }
+      document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
+      renderList();
+    }
+
+    function renderList(){
+      const el = document.getElementById('list');
+      el.innerHTML = '';
+      (template.fields||[]).forEach((f, i)=>{
+        const row = document.createElement('div');
+        row.innerHTML = '#'+i+' <code>'+f.name+'</code> p'+f.page+' x:'+f.x.toFixed(1)+' y:'+f.y.toFixed(1)+' w:'+f.w.toFixed(1)+' h:'+f.h.toFixed(1);
+        el.appendChild(row);
+      });
     }
 
     function placeField(pageNo, ev) {
+      // Nur auslösen wenn nicht gerade resizing/moving
+      if (drag) return;
       const img = document.getElementById('img' + pageNo);
       const rect = img.getBoundingClientRect();
-      const scaleX = img.naturalWidth / img.width;
-      const scaleY = img.naturalHeight / img.height;
-      const x = (ev.clientX - rect.left) * scaleX;
-      const y = (ev.clientY - rect.top) * scaleY;
-
+      const _sx = img.naturalWidth / img.width;
+      const _sy = img.naturalHeight / img.height;
+      const x = (ev.clientX - rect.left) * _sx;
+      const y = (ev.clientY - rect.top) * _sy;
       const name = document.getElementById('fname').value.trim();
       const w = parseFloat(document.getElementById('fwidth').value) || 180;
       const h = parseFloat(document.getElementById('fheight').value) || 20;
       if (!name) { alert('Bitte Feldname eingeben'); return; }
-
       if (!template.fields) template.fields = [];
-      template.fields.push({page: pageNo, x: x, y: y, w: w, h: h, name: name, type: "text"});
-      document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
-      drawOverlay();
+      template.fields.push({page: pageNo, x, y, w, h, name, type: "text"});
+      selectedId = template.fields.length - 1;
+      redraw();
     }
 
-    function undo() {
-      if (template.fields && template.fields.length) {
+    function startMove(e){
+      e.preventDefault();
+      const id = parseInt(e.currentTarget.dataset.id, 10);
+      const page = parseInt(e.currentTarget.dataset.page, 10);
+      selectedId = id;
+      const img = document.getElementById('img' + page);
+      const rect = img.getBoundingClientRect();
+      const _sx = img.naturalWidth / img.width;
+      const _sy = img.naturalHeight / img.height;
+      const f = template.fields[id];
+      drag = {id, mode:'move', startX: e.clientX, startY: e.clientY, startFx: f.x, startFy: f.y, page, _sx, _sy, rect};
+      window.addEventListener('mousemove', onDrag);
+      window.addEventListener('mouseup', endDrag);
+    }
+
+    function startResize(e){
+      e.stopPropagation(); e.preventDefault();
+      const id = parseInt(e.currentTarget.dataset.id, 10);
+      const page = parseInt(e.currentTarget.dataset.page, 10);
+      selectedId = id;
+      const img = document.getElementById('img' + page);
+      const f = template.fields[id];
+      const rect = img.getBoundingClientRect();
+      const _sx = img.naturalWidth / img.width;
+      const _sy = img.naturalHeight / img.height;
+      drag = {id, mode:'resize', startX: e.clientX, startY: e.clientY, startW: f.w, startH: f.h, page, _sx, _sy, rect};
+      window.addEventListener('mousemove', onDrag);
+      window.addEventListener('mouseup', endDrag);
+    }
+
+    function onDrag(e){
+      if (!drag) return;
+      const img = document.getElementById('img' + drag.page);
+      const f = template.fields[drag.id];
+      if (drag.mode === 'move'){
+        const dx = (e.clientX - drag.startX) * drag._sx;
+        const dy = (e.clientY - drag.startY) * drag._sy;
+        const step = e.shiftKey ? 1 : 0; // fein: 1px
+        f.x = Math.max(0, drag.startFx + dx - step*(dx%1));
+        f.y = Math.max(0, drag.startFy + dy - step*(dy%1));
+      } else {
+        const dw = (e.clientX - drag.startX) * drag._sx;
+        const dh = (e.clientY - drag.startY) * drag._sy;
+        f.w = Math.max(10, drag.startW + dw);
+        f.h = Math.max(8, drag.startH + dh);
+      }
+      redraw();
+    }
+
+    function endDrag(){
+      window.removeEventListener('mousemove', onDrag);
+      window.removeEventListener('mouseup', endDrag);
+      drag = null;
+    }
+
+    function renameField(e){
+      e.stopPropagation();
+      const id = parseInt(e.currentTarget.dataset.id, 10);
+      const f = template.fields[id];
+      const name = prompt('Neuer Feldname:', f.name);
+      if (name && name.trim()) { f.name = name.trim(); redraw(); }
+    }
+
+    function undo(){
+      if (template.fields && template.fields.length){
         template.fields.pop();
-        document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
-        drawOverlay();
+        selectedId = (template.fields.length ? template.fields.length-1 : null);
+        redraw();
       }
     }
 
-    function clearAll() {
+    function clearAll(){
       template.fields = [];
-      document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
-      drawOverlay();
+      selectedId = null;
+      redraw();
     }
 
     async function saveTemplate() {
@@ -225,9 +301,8 @@ TPL_DESIGNER = """
       else alert('Fehler beim Speichern');
     }
 
-    // Neu zeichnen nach Bild-Load / Resize
-    window.addEventListener('load', drawOverlay);
-    window.addEventListener('resize', drawOverlay);
+    window.addEventListener('load', redraw);
+    window.addEventListener('resize', redraw);
   </script>
 {% endblock %}
 """
