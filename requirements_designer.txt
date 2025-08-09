@@ -1,5 +1,0 @@
-flask
-pdfrw
-werkzeug
-gunicorn
-pymupdf
