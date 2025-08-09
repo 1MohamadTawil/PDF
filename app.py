@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF-Designer + Filler
-- / -> Bestehender Filler (AcroForm lesen/füllen)
-- /designer -> PDF als Bilder anzeigen, Felder per Klick definieren (ohne echte Felder im Original)
-- /build -> erzeugt NEUE fillable PDF mit AcroForm-Feldern anhand der geklickten Koordinaten
+PDF-Designer + Filler (mit visueller Feld-Vorschau)
+- / -> Filler (liest/füllt AcroForm falls vorhanden)
+- /designer -> PDF als Bild + Live-Overlay-Rechtecke bei Klick
+- /build -> erzeugt NEUE fillable PDF anhand der gesetzten Felder
 """
 import io
 import os
 import json
 import tempfile
-from typing import Dict, List
+from typing import Dict
 
 from flask import Flask, request, redirect, url_for, render_template_string, send_file, session, flash, jsonify
 from werkzeug.utils import secure_filename
 
-# PDF libs
 from pdfrw import PdfReader, PdfWriter, PdfDict, PdfName, PdfObject, IndirectPdfDict
 import fitz  # PyMuPDF
+from jinja2 import DictLoader
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -34,18 +34,24 @@ TPL_LAYOUT = """
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
     <title>PDF Formular</title>
     <style>
+      :root { --accent: #ff3b30; }
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
       .container { max-width: 1100px; margin: 0 auto; }
       .card { border: 1px solid #ddd; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
       .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
       .muted { color: #666; font-size: 0.9rem; }
       button, .btn { background: black; color: white; border: none; padding: 10px 14px; border-radius: 10px; cursor: pointer; text-decoration: none; }
-      input[type=text], select { padding: 8px; border: 1px solid #ccc; border-radius: 8px; }
+      input[type=text], input[type=number], select { padding: 8px; border: 1px solid #ccc; border-radius: 8px; }
       .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
       .flash { background: #fff7cc; border: 1px solid #ffe680; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; }
-      img.page { max-width: 100%; border: 1px solid #ddd; border-radius: 12px; }
-      .field-list { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre; background: #f7f7f7; padding: 8px; border-radius: 8px; }
-      .toolbar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
+      .canvas-wrap { position: relative; display: inline-block; }
+      img.page { display:block; max-width: 100%; border: 1px solid #ddd; border-radius: 12px; }
+      .overlay { position:absolute; top:0; left:0; pointer-events:none; }
+      .rect { position:absolute; border: 2px dashed var(--accent); background: rgba(255,59,48,.06); pointer-events:none; }
+      .pill { position:absolute; transform: translate(-50%, -100%); background: var(--accent); color:#fff; font-size:11px; padding:2px 6px; border-radius: 999px; white-space:nowrap; pointer-events:none;}
+      .toolbar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; flex-wrap:wrap; }
+      .small { font-size: 12px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     </style>
   </head>
   <body>
@@ -85,21 +91,7 @@ TPL_INDEX = """
         {% for f in fields %}
           <div>
             <label>{{ f.label }}</label>
-            {% if f.type == 'text' %}
-              <input type=\"text\" name=\"{{ f.name }}\" value=\"{{ f.value or '' }}\" placeholder=\"{{ f.name }}\">
-            {% elif f.type == 'checkbox' %}
-              <input type=\"checkbox\" name=\"{{ f.name }}\" value=\"Yes\" {% if f.value in ['Yes','On','1',True] %}checked{% endif %}>
-            {% elif f.type == 'radio' %}
-              <div>
-                <input type=\"radio\" name=\"{{ f.group }}\" value=\"{{ f.name }}\" {% if f.selected %}checked{% endif %}> {{ f.name }}
-              </div>
-            {% elif f.type == 'choice' %}
-              <select name=\"{{ f.name }}\">
-                {% for opt in f.options %}
-                  <option value=\"{{ opt }}\" {% if f.value == opt %}selected{% endif %}>{{ opt }}</option>
-                {% endfor %}
-              </select>
-            {% endif %}
+            <input type=\"text\" name=\"{{ f.name }}\" value=\"{{ f.value or '' }}\" placeholder=\"{{ f.name }}\">
           </div>
         {% endfor %}
       </div>
@@ -121,31 +113,74 @@ TPL_DESIGNER = """
     <h2>Designer: Felder definieren</h2>
     <div class=\"toolbar\">
       <label>Feldname: <input type=\"text\" id=\"fname\" placeholder=\"z.B. kunde_name\"></label>
-      <label>Breite: <input type=\"text\" id=\"fwidth\" value=\"180\"></label>
-      <label>Höhe: <input type=\"text\" id=\"fheight\" value=\"20\"></label>
+      <label>Breite: <input type=\"number\" id=\"fwidth\" value=\"180\" min=\"10\" class=\"small\"></label>
+      <label>Höhe: <input type=\"number\" id=\"fheight\" value=\"20\" min=\"8\" class=\"small\"></label>
       <button onclick=\"saveTemplate()\">Template speichern</button>
       <form action=\"{{ url_for('build') }}\" method=\"post\" style=\"display:inline\">
         <button type=\"submit\">Neue fillable PDF erzeugen</button>
       </form>
       <a class=\"btn\" href=\"{{ url_for('index') }}\">Zurück</a>
+      <span class=\"muted small\">Tipp: Zoomen mit Browser (cmd/strg + / -)</span>
     </div>
-    <p class=\"muted\">Klicke auf die Seite, um ein Feld zu setzen. Koordinaten werden automatisch berechnet.</p>
+    <p class=\"muted\">Klicke auf die Seite, um ein Feld zu setzen. Jedes Feld erscheint sofort als rotes Rechteck.</p>
   </div>
 
   {% for i in range(1, page_count+1) %}
     <div class=\"card\">
       <h3>Seite {{ i }}</h3>
-      <img class=\"page\" id=\"img{{ i }}\" src=\"{{ url_for('page_png', pageno=i) }}\" onclick=\"placeField({{ i }}, event)\">
+      <div class=\"canvas-wrap\" id=\"wrap{{ i }}\">
+        <img class=\"page\" id=\"img{{ i }}\" src=\"{{ url_for('page_png', pageno=i) }}\" onclick=\"placeField({{ i }}, event)\" />
+        <div class=\"overlay\" id=\"ov{{ i }}\"></div>
+      </div>
     </div>
   {% endfor %}
 
   <div class=\"card\">
     <h3>Aktuelles Template ({{ template_name }})</h3>
-    <pre class=\"field-list\" id=\"templatePre\">{{ template_json }}</pre>
+    <pre class=\"mono small\" id=\"templatePre\">{{ template_json }}</pre>
+    <div class=\"row\">
+      <button onclick=\"undo()\">Letztes Feld entfernen</button>
+      <button onclick=\"clearAll()\">Alle Felder löschen</button>
+    </div>
   </div>
 
   <script>
     const template = {{ template_json | safe }};
+
+    function drawOverlay() {
+      // Leeren
+      document.querySelectorAll('.overlay').forEach(ov => ov.innerHTML = '');
+      if (!template.fields) return;
+      for (const f of template.fields) {
+        const wrap = document.getElementById('wrap' + f.page);
+        const img = document.getElementById('img' + f.page);
+        const ov = document.getElementById('ov' + f.page);
+        if (!wrap || !img || !ov) continue;
+        // Skaliere von natural -> aktuell
+        const sx = img.width / img.naturalWidth;
+        const sy = img.height / img.naturalHeight;
+        const left = f.x * sx;
+        const top = f.y * sy;
+        const w = f.w * sx;
+        const h = f.h * sy;
+        const rect = document.createElement('div');
+        rect.className = 'rect';
+        rect.style.left = left + 'px';
+        rect.style.top = top + 'px';
+        rect.style.width = w + 'px';
+        rect.style.height = h + 'px';
+        const pill = document.createElement('div');
+        pill.className = 'pill';
+        pill.style.left = (left + w/2) + 'px';
+        pill.style.top = top + 'px';
+        pill.textContent = f.name;
+        ov.appendChild(rect);
+        ov.appendChild(pill);
+        // Größe der Overlay-Fläche an Bild anpassen
+        ov.style.width = img.clientWidth + 'px';
+        ov.style.height = img.clientHeight + 'px';
+      }
+    }
 
     function placeField(pageNo, ev) {
       const img = document.getElementById('img' + pageNo);
@@ -163,6 +198,21 @@ TPL_DESIGNER = """
       if (!template.fields) template.fields = [];
       template.fields.push({page: pageNo, x: x, y: y, w: w, h: h, name: name, type: "text"});
       document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
+      drawOverlay();
+    }
+
+    function undo() {
+      if (template.fields && template.fields.length) {
+        template.fields.pop();
+        document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
+        drawOverlay();
+      }
+    }
+
+    function clearAll() {
+      template.fields = [];
+      document.getElementById('templatePre').textContent = JSON.stringify(template, null, 2);
+      drawOverlay();
     }
 
     async function saveTemplate() {
@@ -174,11 +224,15 @@ TPL_DESIGNER = """
       if (res.ok) alert('Template gespeichert');
       else alert('Fehler beim Speichern');
     }
+
+    // Neu zeichnen nach Bild-Load / Resize
+    window.addEventListener('load', drawOverlay);
+    window.addEventListener('resize', drawOverlay);
   </script>
 {% endblock %}
 """
 
-from jinja2 import DictLoader
+# ---------------- Template Loader ----------------
 app.jinja_loader = DictLoader({
     "layout.html": TPL_LAYOUT,
     "index.html": TPL_INDEX,
@@ -193,26 +247,20 @@ def _set_need_appearances(pdf):
 
 def _get_widgets(pdf):
     fields = {}
-    radio_groups = {}
     if not getattr(pdf.Root, 'AcroForm', None):
-        return fields, radio_groups
+        return fields, {}
     for page in pdf.pages:
         annots = getattr(page, 'Annots', []) or []
         for annot in annots:
             if annot.get('/Subtype') != PdfName('Widget'):
                 continue
             name = (annot.get('/T') or '').strip('()') if annot.get('/T') else None
-            field_type = annot.get('/FT')
-            if not name and field_type == PdfName('Btn'):
-                parent = annot.get('/Parent')
-                if parent and parent.get('/T'):
-                    name = parent.get('/T').strip('()')
             if not name:
                 continue
             fields[name] = annot
-    return fields, radio_groups
+    return fields, {}
 
-def _field_desc(name, widget, radio_selected):
+def _field_desc(name, widget, _radio_selected):
     ft = widget.get('/FT')
     label = widget.get('/TU') or name
     if ft == PdfName('Tx'):
@@ -254,10 +302,7 @@ def upload():
 
     _set_need_appearances(pdf)
     widgets, radio_selected = _get_widgets(pdf)
-    fields_render = []
-    for name, w in widgets.items():
-        fields_render.append(_field_desc(name, w, radio_selected))
-
+    fields_render = [_field_desc(name, w, radio_selected) for name, w in widgets.items()]
     session['fields_render'] = fields_render
     flash(f"{len(fields_render)} AcroForm-Feld(er) erkannt.{'' if len(fields_render)>0 else ' (keine)'}")
     return redirect(url_for('index'))
@@ -291,7 +336,6 @@ def designer():
         flash('Bitte zuerst eine PDF hochladen.')
         return redirect(url_for('index'))
     doc = fitz.open(pdf_path)
-    session['page_count'] = len(doc)
     tmpl = session.get('template') or {"fields": [], "page_sizes": []}
     if not tmpl["page_sizes"]:
         for p in doc:
